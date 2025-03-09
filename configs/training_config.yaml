@@ -1,0 +1,42 @@
+environment:
+  num_players: 3
+  num_decks: 8
+  initial_bankroll: 10000
+  max_hands: 1000
+  stop_loss: -0.5
+  take_profit: 2.0
+  max_bet_ratio: 0.02
+
+agent:
+  network:
+    use_noisy_nets: true
+    hidden_sizes: [256, 128]
+    dropout_rate: 0.2
+    initial_lr: 0.001
+    lr_min: 0.000001
+    lr_t0: 1000
+    lr_tmult: 2
+
+  training:
+    num_episodes: 10000
+    batch_size: 64
+    gamma: 0.99
+    target_update: 10
+    patience: 1000
+
+replay_buffer:
+  capacity: 10000
+  n_step: 3
+  alpha: 0.6
+  beta_start: 0.4
+  beta_frames: 100000
+
+risk_adjustment:
+  risk_free_rate: 0.02
+  max_leverage: 2.0
+  kelly_fraction: 0.25
+
+logging:
+  log_interval: 100
+  save_model_path: "models/"
+  tensorboard_dir: "runs/" 
