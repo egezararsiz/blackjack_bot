@@ -4,16 +4,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class NoisyLinear(nn.Module):
+    """Noisy linear layer for exploration."""
     def __init__(self, in_features, out_features, sigma_init=0.017):
-        """
-        Initialize a noisy linear layer.
-        
-        Args:
-            in_features (int): Input features
-            out_features (int): Output features
-            sigma_init (float): Initial noise standard deviation
-        """
-        super(NoisyLinear, self).__init__()
+        super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.sigma_init = sigma_init
@@ -57,47 +50,69 @@ class NoisyLinear(nn.Module):
             bias = self.bias_mu
         return F.linear(x, weight, bias)
 
-class DQN(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_sizes=[256, 128], noisy=True, dropout_rate=0.2):
-        """
-        Initialize DQN network.
+class ModularDQN(nn.Module):
+    """DQN with separate processing paths for different observation components."""
+    def __init__(self, input_dims, output_dim, hidden_sizes=[256, 128], noisy=True, dropout_rate=0.2):
+        super().__init__()
         
-        Args:
-            input_dim (int): Input dimension
-            output_dim (int): Output dimension (number of actions)
-            hidden_sizes (list): List of hidden layer sizes
-            noisy (bool): Whether to use noisy linear layers
-            dropout_rate (float): Dropout probability
-        """
-        super(DQN, self).__init__()
+        # Input dimensions for each component
+        self.rank_freq_dim = input_dims['rank_frequencies']
+        self.counts_dim = input_dims['counts']
+        self.hand_info_dim = input_dims['hand_info']
+        self.bets_dim = input_dims['bets']
         
+        LinearLayer = NoisyLinear if noisy else nn.Linear
+        
+        # Rank frequencies processing path
+        self.rank_freq_net = nn.Sequential(
+            LinearLayer(self.rank_freq_dim, 32),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
+        )
+        
+        # Counts processing path
+        self.counts_net = nn.Sequential(
+            LinearLayer(self.counts_dim, 16),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
+        )
+        
+        # Hand info processing path
+        self.hand_info_net = nn.Sequential(
+            LinearLayer(self.hand_info_dim, 16),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
+        )
+        
+        # Bets processing path
+        self.bets_net = nn.Sequential(
+            LinearLayer(self.bets_dim, 16),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
+        )
+        
+        # Combined features dimension
+        combined_dim = 32 + 16 + 16 + 16  # Sum of output dimensions from each path
+        
+        # Main network
         layers = []
-        prev_size = input_dim
+        prev_size = combined_dim
         
-        # Build hidden layers
         for size in hidden_sizes:
-            if noisy:
-                layers.append(NoisyLinear(prev_size, size))
-            else:
-                layers.append(nn.Linear(prev_size, size))
+            layers.append(LinearLayer(prev_size, size))
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(dropout_rate))
             prev_size = size
         
-        # Output layer
-        if noisy:
-            layers.append(NoisyLinear(prev_size, output_dim))
-        else:
-            layers.append(nn.Linear(prev_size, output_dim))
+        layers.append(LinearLayer(prev_size, output_dim))
         
-        self.net = nn.Sequential(*layers)
+        self.main_net = nn.Sequential(*layers)
         self.noisy = noisy
         
         # Initialize weights
         self.apply(self._init_weights)
-        
+    
     def _init_weights(self, module):
-        """Initialize network weights."""
         if isinstance(module, (nn.Linear, NoisyLinear)):
             if hasattr(module, 'weight_mu'):
                 nn.init.xavier_uniform_(module.weight_mu)
@@ -108,40 +123,76 @@ class DQN(nn.Module):
                     nn.init.zeros_(module.bias_mu)
                 else:
                     nn.init.zeros_(module.bias)
-
+    
     def reset_noise(self):
-        """Reset noise for all noisy layers."""
         if self.noisy:
-            for module in self.net:
+            for module in self.modules():
                 if isinstance(module, NoisyLinear):
                     module.reset_noise()
-
+    
     def forward(self, x):
-        """Forward pass."""
-        return self.net(x)
-
-class DuelingDQN(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_sizes=[256, 128], noisy=True, dropout_rate=0.2):
-        """
-        Initialize Dueling DQN network.
+        # Process each component
+        rank_freq_features = self.rank_freq_net(x['rank_frequencies'])
+        counts_features = self.counts_net(x['counts'])
+        hand_info_features = self.hand_info_net(x['hand_info'])
+        bets_features = self.bets_net(x['bets'])
         
-        Args:
-            input_dim (int): Input dimension
-            output_dim (int): Output dimension (number of actions)
-            hidden_sizes (list): List of hidden layer sizes
-            noisy (bool): Whether to use noisy linear layers
-            dropout_rate (float): Dropout probability
-        """
-        super(DuelingDQN, self).__init__()
+        # Combine features
+        combined = torch.cat([
+            rank_freq_features,
+            counts_features,
+            hand_info_features,
+            bets_features
+        ], dim=1)
+        
+        return self.main_net(combined)
+
+class ModularDuelingDQN(nn.Module):
+    """Dueling DQN with separate processing paths for different observation components."""
+    def __init__(self, input_dims, output_dim, hidden_sizes=[256, 128], noisy=True, dropout_rate=0.2):
+        super().__init__()
+        
+        # Input dimensions for each component
+        self.rank_freq_dim = input_dims['rank_frequencies']
+        self.counts_dim = input_dims['counts']
+        self.hand_info_dim = input_dims['hand_info']
+        self.bets_dim = input_dims['bets']
+        
+        LinearLayer = NoisyLinear if noisy else nn.Linear
+        
+        # Component processing paths (same as ModularDQN)
+        self.rank_freq_net = nn.Sequential(
+            LinearLayer(self.rank_freq_dim, 32),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
+        )
+        
+        self.counts_net = nn.Sequential(
+            LinearLayer(self.counts_dim, 16),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
+        )
+        
+        self.hand_info_net = nn.Sequential(
+            LinearLayer(self.hand_info_dim, 16),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
+        )
+        
+        self.bets_net = nn.Sequential(
+            LinearLayer(self.bets_dim, 16),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
+        )
+        
+        # Combined features dimension
+        combined_dim = 32 + 16 + 16 + 16
         
         # Feature layer
         feature_layers = []
-        prev_size = input_dim
-        for size in hidden_sizes[:-1]:  # All but last hidden layer
-            if noisy:
-                feature_layers.append(NoisyLinear(prev_size, size))
-            else:
-                feature_layers.append(nn.Linear(prev_size, size))
+        prev_size = combined_dim
+        for size in hidden_sizes[:-1]:
+            feature_layers.append(LinearLayer(prev_size, size))
             feature_layers.append(nn.ReLU())
             feature_layers.append(nn.Dropout(dropout_rate))
             prev_size = size
@@ -149,42 +200,27 @@ class DuelingDQN(nn.Module):
         self.feature_layer = nn.Sequential(*feature_layers)
         
         # Value stream
-        value_layers = []
-        if noisy:
-            value_layers.append(NoisyLinear(prev_size, hidden_sizes[-1]))
-            value_layers.append(nn.ReLU())
-            value_layers.append(nn.Dropout(dropout_rate))
-            value_layers.append(NoisyLinear(hidden_sizes[-1], 1))
-        else:
-            value_layers.append(nn.Linear(prev_size, hidden_sizes[-1]))
-            value_layers.append(nn.ReLU())
-            value_layers.append(nn.Dropout(dropout_rate))
-            value_layers.append(nn.Linear(hidden_sizes[-1], 1))
-        
-        self.value_stream = nn.Sequential(*value_layers)
+        self.value_stream = nn.Sequential(
+            LinearLayer(prev_size, hidden_sizes[-1]),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            LinearLayer(hidden_sizes[-1], 1)
+        )
         
         # Advantage stream
-        advantage_layers = []
-        if noisy:
-            advantage_layers.append(NoisyLinear(prev_size, hidden_sizes[-1]))
-            advantage_layers.append(nn.ReLU())
-            advantage_layers.append(nn.Dropout(dropout_rate))
-            advantage_layers.append(NoisyLinear(hidden_sizes[-1], output_dim))
-        else:
-            advantage_layers.append(nn.Linear(prev_size, hidden_sizes[-1]))
-            advantage_layers.append(nn.ReLU())
-            advantage_layers.append(nn.Dropout(dropout_rate))
-            advantage_layers.append(nn.Linear(hidden_sizes[-1], output_dim))
-        
-        self.advantage_stream = nn.Sequential(*advantage_layers)
+        self.advantage_stream = nn.Sequential(
+            LinearLayer(prev_size, hidden_sizes[-1]),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            LinearLayer(hidden_sizes[-1], output_dim)
+        )
         
         self.noisy = noisy
         
         # Initialize weights
         self.apply(self._init_weights)
-        
+    
     def _init_weights(self, module):
-        """Initialize network weights."""
         if isinstance(module, (nn.Linear, NoisyLinear)):
             if hasattr(module, 'weight_mu'):
                 nn.init.xavier_uniform_(module.weight_mu)
@@ -195,18 +231,32 @@ class DuelingDQN(nn.Module):
                     nn.init.zeros_(module.bias_mu)
                 else:
                     nn.init.zeros_(module.bias)
-
+    
     def reset_noise(self):
-        """Reset noise for all noisy layers."""
         if self.noisy:
-            for module in [self.feature_layer, self.value_stream, self.advantage_stream]:
-                for layer in module:
-                    if isinstance(layer, NoisyLinear):
-                        layer.reset_noise()
-
+            for module in self.modules():
+                if isinstance(module, NoisyLinear):
+                    module.reset_noise()
+    
     def forward(self, x):
-        """Forward pass with dueling architecture."""
-        features = self.feature_layer(x)
+        # Process each component
+        rank_freq_features = self.rank_freq_net(x['rank_frequencies'])
+        counts_features = self.counts_net(x['counts'])
+        hand_info_features = self.hand_info_net(x['hand_info'])
+        bets_features = self.bets_net(x['bets'])
+        
+        # Combine features
+        combined = torch.cat([
+            rank_freq_features,
+            counts_features,
+            hand_info_features,
+            bets_features
+        ], dim=1)
+        
+        # Process through feature layer
+        features = self.feature_layer(combined)
+        
+        # Calculate value and advantage
         value = self.value_stream(features)
         advantage = self.advantage_stream(features)
         

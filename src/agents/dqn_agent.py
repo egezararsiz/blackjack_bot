@@ -1,40 +1,40 @@
 import os
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from typing import Dict, Tuple, Any
+from typing import Dict, Any
 
-from .networks import DQN, DuelingDQN
+from .networks import ModularDQN, ModularDuelingDQN
 from ..utils.replay_buffer import NStepReplayBuffer
 from ..utils.risk_calculator import RiskCalculator
 
 class DQNAgent:
     def __init__(
         self,
-        state_dim: int,
+        input_dims: Dict[str, int],
         action_dim: int,
         config: Dict[str, Any]
     ):
         """
-        Initialize DQN agent.
+        Initialize DQN agent with modular observation handling.
         
         Args:
-            state_dim (int): Dimension of state space
+            input_dims (dict): Dictionary of input dimensions for each observation component
             action_dim (int): Dimension of action space
             config (dict): Configuration dictionary
         """
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.action_dim = action_dim
+        self._config = config
         
         # Load network configuration
         network_config = config['agent']['network']
         self.use_dueling = network_config.get('use_dueling', False)
         
         # Initialize networks
-        NetworkClass = DuelingDQN if self.use_dueling else DQN
+        NetworkClass = ModularDuelingDQN if self.use_dueling else ModularDQN
         self.policy_net = NetworkClass(
-            state_dim,
+            input_dims,
             action_dim,
             hidden_sizes=network_config['hidden_sizes'],
             noisy=network_config['use_noisy_nets'],
@@ -42,7 +42,7 @@ class DQNAgent:
         ).to(self.device)
         
         self.target_net = NetworkClass(
-            state_dim,
+            input_dims,
             action_dim,
             hidden_sizes=network_config['hidden_sizes'],
             noisy=network_config['use_noisy_nets'],
@@ -92,52 +92,37 @@ class DQNAgent:
         self.episode_rewards = []
         self.running_reward = 0
         self.best_reward = float('-inf')
-        
-    def select_action(self, state: np.ndarray) -> int:
-        """
-        Select an action using the policy network.
-        
-        Args:
-            state (np.ndarray): Current state
-            
-        Returns:
-            int: Selected action
-        """
+    
+    def _prepare_state(self, state_dict: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
+        """Convert state dictionary to tensors."""
+        return {
+            key: torch.FloatTensor(value).unsqueeze(0).to(self.device)
+            for key, value in state_dict.items()
+        }
+    
+    def select_action(self, state_dict: Dict[str, np.ndarray]) -> int:
+        """Select action using the policy network."""
         with torch.no_grad():
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            q_values = self.policy_net(state_tensor)
+            state_tensors = self._prepare_state(state_dict)
+            q_values = self.policy_net(state_tensors)
             return q_values.max(1)[1].item()
     
     def update(
         self,
-        state: np.ndarray,
+        state_dict: Dict[str, np.ndarray],
         action: int,
         reward: float,
-        next_state: np.ndarray,
+        next_state_dict: Dict[str, np.ndarray],
         done: bool,
         bankroll: float,
         initial_bankroll: float
     ) -> float:
-        """
-        Update the agent's knowledge.
-        
-        Args:
-            state (np.ndarray): Current state
-            action (int): Action taken
-            reward (float): Reward received
-            next_state (np.ndarray): Next state
-            done (bool): Whether episode is done
-            bankroll (float): Current bankroll
-            initial_bankroll (float): Initial bankroll
-            
-        Returns:
-            float: Loss value
-        """
+        """Update the agent's knowledge."""
         # Apply risk adjustment to reward
         adjusted_reward = self.risk_calculator.adjust_reward(reward, bankroll, initial_bankroll)
         
         # Store transition in replay buffer
-        self.replay_buffer.push(state, action, adjusted_reward, next_state, done)
+        self.replay_buffer.push(state_dict, action, adjusted_reward, next_state_dict, done)
         
         # Return if not enough samples
         if len(self.replay_buffer) < self.batch_size:
@@ -145,20 +130,34 @@ class DQNAgent:
         
         # Sample batch and prepare tensors
         states, actions, rewards, next_states, dones, importances = self.replay_buffer.sample(self.batch_size)
-        states = states.to(self.device)
-        actions = actions.to(self.device)
-        rewards = rewards.to(self.device)
-        next_states = next_states.to(self.device)
-        dones = dones.to(self.device)
-        importances = importances.to(self.device)
+        
+        # Convert state dictionaries to tensors
+        state_tensors = {
+            key: torch.FloatTensor(
+                np.stack([s[key] for s in states])
+            ).to(self.device)
+            for key in states[0].keys()
+        }
+        
+        next_state_tensors = {
+            key: torch.FloatTensor(
+                np.stack([s[key] for s in next_states])
+            ).to(self.device)
+            for key in next_states[0].keys()
+        }
+        
+        actions = torch.LongTensor(actions).to(self.device)
+        rewards = torch.FloatTensor(rewards).to(self.device)
+        dones = torch.FloatTensor(dones).to(self.device)
+        importances = torch.FloatTensor(importances).to(self.device)
         
         # Compute current Q values
-        current_q_values = self.policy_net(states).gather(1, actions.unsqueeze(1))
+        current_q_values = self.policy_net(state_tensors).gather(1, actions.unsqueeze(1))
         
         # Compute next Q values using double Q-learning
         with torch.no_grad():
-            next_actions = self.policy_net(next_states).max(1)[1]
-            next_q_values = self.target_net(next_states).gather(1, next_actions.unsqueeze(1))
+            next_actions = self.policy_net(next_state_tensors).max(1)[1]
+            next_q_values = self.target_net(next_state_tensors).gather(1, next_actions.unsqueeze(1))
             target_q_values = rewards.unsqueeze(1) + (1 - dones.unsqueeze(1)) * self.gamma * next_q_values
         
         # Compute loss with importance sampling weights
@@ -185,12 +184,7 @@ class DQNAgent:
         return loss.item()
     
     def update_metrics(self, episode_reward: float) -> None:
-        """
-        Update training metrics.
-        
-        Args:
-            episode_reward (float): Total reward for the episode
-        """
+        """Update training metrics."""
         self.episode_rewards.append(episode_reward)
         self.running_reward = 0.05 * episode_reward + 0.95 * self.running_reward
         
@@ -198,12 +192,7 @@ class DQNAgent:
             self.best_reward = self.running_reward
     
     def save(self, path: str) -> None:
-        """
-        Save the agent's state.
-        
-        Args:
-            path (str): Path to save the model
-        """
+        """Save the agent's state."""
         os.makedirs(os.path.dirname(path), exist_ok=True)
         
         torch.save({
@@ -220,12 +209,7 @@ class DQNAgent:
         }, path)
     
     def load(self, path: str) -> None:
-        """
-        Load the agent's state.
-        
-        Args:
-            path (str): Path to load the model from
-        """
+        """Load the agent's state."""
         checkpoint = torch.load(path, map_location=self.device)
         
         self.training_step = checkpoint['training_step']
@@ -238,14 +222,9 @@ class DQNAgent:
         self.best_reward = checkpoint['best_reward']
         self.episode_rewards = checkpoint['episode_rewards']
         self.risk_calculator = checkpoint['risk_calculator']
-        
+    
     def get_metrics(self) -> Dict[str, Any]:
-        """
-        Get current training metrics.
-        
-        Returns:
-            dict: Dictionary containing current metrics
-        """
+        """Get current training metrics."""
         return {
             'training_step': self.training_step,
             'running_reward': self.running_reward,

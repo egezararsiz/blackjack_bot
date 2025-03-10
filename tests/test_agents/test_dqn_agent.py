@@ -4,12 +4,32 @@ import numpy as np
 from src.agents.dqn_agent import DQNAgent
 
 @pytest.fixture
+def input_dims():
+    """Create test input dimensions."""
+    return {
+        'rank_frequencies': 13,
+        'counts': 3,
+        'hand_info': 4,
+        'bets': 4
+    }
+
+@pytest.fixture
+def sample_observation(input_dims):
+    """Create a sample observation dictionary."""
+    return {
+        'rank_frequencies': np.random.randint(0, 4, input_dims['rank_frequencies']).astype(np.float32),
+        'counts': np.random.normal(0, 1, input_dims['counts']).astype(np.float32),
+        'hand_info': np.random.random(input_dims['hand_info']).astype(np.float32),
+        'bets': np.random.random(input_dims['bets']).astype(np.float32)
+    }
+
+@pytest.fixture
 def config():
     """Create a test configuration."""
     return {
         'agent': {
             'network': {
-                'use_dueling': False,
+                'use_dueling': True,
                 'use_noisy_nets': True,
                 'hidden_sizes': [64, 32],
                 'dropout_rate': 0.1,
@@ -38,32 +58,47 @@ def config():
     }
 
 @pytest.fixture
-def agent(config):
+def agent(input_dims, config):
     """Create a test agent."""
-    return DQNAgent(state_dim=100, action_dim=5, config=config)
+    return DQNAgent(input_dims=input_dims, action_dim=5, config=config)
 
-def test_agent_initialization(agent, config):
+def test_agent_initialization(agent, config, input_dims):
     """Test agent initialization."""
     assert isinstance(agent.policy_net, torch.nn.Module)
     assert isinstance(agent.target_net, torch.nn.Module)
     assert agent.batch_size == config['agent']['training']['batch_size']
     assert agent.gamma == config['agent']['training']['gamma']
     assert agent.target_update == config['agent']['training']['target_update']
+    
+    # Test network architecture
+    for net in [agent.policy_net, agent.target_net]:
+        assert net.rank_freq_dim == input_dims['rank_frequencies']
+        assert net.counts_dim == input_dims['counts']
+        assert net.hand_info_dim == input_dims['hand_info']
+        assert net.bets_dim == input_dims['bets']
 
-def test_select_action(agent):
+def test_prepare_state(agent, sample_observation):
+    """Test state preparation."""
+    state_tensors = agent._prepare_state(sample_observation)
+    
+    for key in sample_observation:
+        assert isinstance(state_tensors[key], torch.Tensor)
+        assert state_tensors[key].shape == (1, sample_observation[key].shape[0])
+        assert state_tensors[key].device == agent.device
+
+def test_select_action(agent, sample_observation):
     """Test action selection."""
-    state = np.random.random(100)
-    action = agent.select_action(state)
+    action = agent.select_action(sample_observation)
     assert isinstance(action, int)
     assert 0 <= action < 5
 
-def test_update(agent):
+def test_update(agent, sample_observation):
     """Test agent update."""
     # Create fake batch
-    state = np.random.random(100)
+    state = sample_observation
     action = 0
     reward = 1.0
-    next_state = np.random.random(100)
+    next_state = {k: v + 0.1 for k, v in sample_observation.items()}
     done = False
     bankroll = 10000
     initial_bankroll = 10000
@@ -91,23 +126,34 @@ def test_update_metrics(agent):
     assert agent.running_reward != initial_reward
     assert agent.best_reward == max(initial_reward, agent.running_reward)
 
-def test_save_load(agent, tmp_path):
+def test_save_load(agent, tmp_path, sample_observation):
     """Test model saving and loading."""
+    # Get initial action and Q-values
+    initial_action = agent.select_action(sample_observation)
+    with torch.no_grad():
+        initial_q_values = agent.policy_net(agent._prepare_state(sample_observation))
+    
     # Save model
     save_path = tmp_path / "test_model.pth"
     agent.save(str(save_path))
     
     # Create new agent
-    new_agent = DQNAgent(state_dim=100, action_dim=5, config=agent._config)
+    new_agent = DQNAgent(
+        input_dims=agent.policy_net.rank_freq_dim,
+        action_dim=5,
+        config=agent._config
+    )
     
     # Load saved model
     new_agent.load(str(save_path))
     
-    # Check if states match
-    assert torch.equal(
-        next(agent.policy_net.parameters()),
-        next(new_agent.policy_net.parameters())
-    )
+    # Check if actions and Q-values match
+    loaded_action = new_agent.select_action(sample_observation)
+    with torch.no_grad():
+        loaded_q_values = new_agent.policy_net(new_agent._prepare_state(sample_observation))
+    
+    assert initial_action == loaded_action
+    assert torch.allclose(initial_q_values, loaded_q_values)
     assert agent.training_step == new_agent.training_step
     assert agent.running_reward == new_agent.running_reward
     assert agent.best_reward == new_agent.best_reward
@@ -128,24 +174,32 @@ def test_noise_reset(agent):
     """Test noise reset in noisy networks."""
     if agent.policy_net.noisy:
         # Get initial parameters
-        initial_params = next(agent.policy_net.parameters()).clone()
+        initial_params = {}
+        for name, param in agent.policy_net.named_parameters():
+            if 'weight_mu' in name:
+                initial_params[name] = param.clone()
         
         # Reset noise
         agent.policy_net.reset_noise()
         
         # Parameters should be different after reset
-        assert not torch.equal(initial_params, next(agent.policy_net.parameters()))
+        for name, param in agent.policy_net.named_parameters():
+            if 'weight_mu' in name:
+                assert not torch.equal(initial_params[name], param)
 
-def test_target_net_update(agent):
+def test_target_net_update(agent, sample_observation):
     """Test target network update."""
     # Get initial target parameters
-    initial_target_params = next(agent.target_net.parameters()).clone()
+    initial_target_params = {}
+    for name, param in agent.target_net.named_parameters():
+        if 'weight_mu' in name:
+            initial_target_params[name] = param.clone()
     
     # Update policy net
-    state = np.random.random(100)
+    state = sample_observation
     action = 0
     reward = 1.0
-    next_state = np.random.random(100)
+    next_state = {k: v + 0.1 for k, v in sample_observation.items()}
     done = False
     bankroll = 10000
     initial_bankroll = 10000
@@ -155,4 +209,6 @@ def test_target_net_update(agent):
         agent.update(state, action, reward, next_state, done, bankroll, initial_bankroll)
     
     # Target parameters should be different now
-    assert not torch.equal(initial_target_params, next(agent.target_net.parameters())) 
+    for name, param in agent.target_net.named_parameters():
+        if 'weight_mu' in name:
+            assert not torch.equal(initial_target_params[name], param) 
